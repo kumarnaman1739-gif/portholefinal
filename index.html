@@ -152,7 +152,14 @@ const TRAFFIC_API =
 
 
 const BUS_ID =
-    "BUS_01";
+    localStorage.getItem("device_id") ||
+    (() => {
+        const id = "DEVICE_" + crypto.randomUUID();
+
+        localStorage.setItem("device_id", id);
+
+        return id;
+    })();
 
 
 const INPUT_SIZE =
