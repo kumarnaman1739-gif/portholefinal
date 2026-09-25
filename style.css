@@ -1,0 +1,78 @@
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #0d1117;
+    color: white;
+    font-family: Arial, sans-serif;
+}
+
+.app {
+    width: 100%;
+    max-width: 500px;
+    margin: auto;
+    padding: 20px;
+}
+
+h1 {
+    margin-bottom: 5px;
+}
+
+.subtitle {
+    color: #8b949e;
+    margin-top: 0;
+}
+
+.camera-box {
+    width: 100%;
+    margin-top: 20px;
+    background: #161b22;
+    border-radius: 15px;
+    overflow: hidden;
+}
+
+#camera {
+    width: 100%;
+    display: block;
+}
+
+button {
+    width: 100%;
+    padding: 16px;
+    margin-top: 12px;
+    border: none;
+    border-radius: 12px;
+    font-size: 16px;
+    font-weight: bold;
+    color: white;
+}
+
+.start-button {
+    background: #238636;
+}
+
+.status {
+    text-align: center;
+    margin-top: 15px;
+    color: #3fb950;
+}
+
+.info {
+    background: #161b22;
+    border-radius: 12px;
+    padding: 15px;
+    margin-top: 15px;
+}
+
+.info h3 {
+    margin: 0 0 8px 0;
+    font-size: 16px;
+}
+
+.info p {
+    margin: 0;
+    color: #8b949e;
+    line-height: 1.6;
+}

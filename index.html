@@ -1,0 +1,2638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>PotholeWatch</title>
+
+    <link rel="stylesheet" href="style.css">
+
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+
+    <style>
+        .camera-box {
+            position: relative;
+            width: 100%;
+            overflow: hidden;
+        }
+
+        #camera {
+            width: 100%;
+            display: block;
+        }
+
+        #overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="app">
+
+    <h1>🕳️ PotholeWatch</h1>
+    <p class="subtitle">Live AI road condition detection</p>
+
+    <div class="camera-box">
+
+        <video
+            id="camera"
+            autoplay
+            playsinline>
+        </video>
+
+        <canvas id="overlay"></canvas>
+
+    </div>
+
+    <button
+        class="start-button"
+        id="startButton"
+        onclick="startDetection()">
+
+        📹 Start Live Detection
+
+    </button>
+
+    <div class="status">
+        <span id="status">
+            Loading AI models...
+        </span>
+    </div>
+
+    <div class="info">
+
+        <h3>📍 Current Location</h3>
+
+        <p id="location">
+            Waiting for GPS...
+        </p>
+
+    </div>
+
+    <div class="info">
+
+        <h3>🚗 Current 1 km Vehicle Count</h3>
+
+        <p id="vehicleCount">
+            0
+        </p>
+
+    </div>
+
+    <div class="info">
+
+        <h3>🛣️ Distance in Current Segment</h3>
+
+        <p id="segmentDistance">
+            0.00 km
+        </p>
+
+    </div>
+
+    <div class="info">
+
+        <h3>🕐 Last Report Sent</h3>
+
+        <p id="lastSent">
+            Nothing sent yet
+        </p>
+
+    </div>
+
+    <div class="info">
+
+        <h3>📦 Reports Waiting</h3>
+
+        <p id="reportCount">
+            0
+        </p>
+
+    </div>
+
+    <div class="info">
+
+        <h3>🕳️ Detection Log</h3>
+
+        <div id="reportLog"></div>
+
+    </div>
+
+</div>
+
+
+<script>
+
+
+const MODEL_PATH =
+    "model/best.onnx";
+
+const VEHICLE_MODEL_PATH =
+    "model/yolo26n.onnx";
+
+
+const API_BASE =
+    "https://sih-6ah8.onrender.com";
+
+const POTHOLE_API =
+    `${API_BASE}/reports`;
+
+const LOCATION_API =
+    `${API_BASE}/bus/location`;
+
+const TRAFFIC_API =
+    `${API_BASE}/bus/traffic-segment`;
+
+
+const BUS_ID =
+    "BUS_01";
+
+
+const INPUT_SIZE =
+    640;
+
+const CONFIDENCE_THRESHOLD =
+    0.30;
+
+const VEHICLE_CONFIDENCE_THRESHOLD =
+    0.18;
+
+const NMS_IOU_THRESHOLD =
+    0.45;
+
+const DETECTION_COOLDOWN =
+    3000;
+
+const REPORT_INTERVAL =
+    60000;
+
+
+const LOCATION_INTERVAL =
+    5000;
+
+const VEHICLE_DISTANCE_TARGET_KM =
+    1.0;
+
+
+const TRACK_DISTANCE_PIXELS =
+    150;
+
+const TRACK_LOST_TIME =
+    2000;
+
+
+const VEHICLE_TRACK_DISTANCE_PIXELS =
+    180;
+
+const VEHICLE_TRACK_LOST_TIME =
+    2500;
+
+
+const video =
+    document.getElementById("camera");
+
+const canvas =
+    document.getElementById("overlay");
+
+const ctx =
+    canvas.getContext("2d");
+
+const statusText =
+    document.getElementById("status");
+
+const locationText =
+    document.getElementById("location");
+
+const vehicleCountText =
+    document.getElementById("vehicleCount");
+
+const segmentDistanceText =
+    document.getElementById("segmentDistance");
+
+const reportCount =
+    document.getElementById("reportCount");
+
+const lastSent =
+    document.getElementById("lastSent");
+
+const reportLog =
+    document.getElementById("reportLog");
+
+const startButton =
+    document.getElementById("startButton");
+
+
+let session = null;
+
+let vehicleSession = null;
+
+let latitude = null;
+
+let longitude = null;
+
+let detectionRunning = false;
+
+let pendingReports = [];
+
+let lastDetectionTime = 0;
+
+let gpsWatcher = null;
+
+let locationTimer = null;
+
+
+let potholeTracks = [];
+
+let nextTrackId = 1;
+
+
+let vehicleTracks = [];
+
+let nextVehicleTrackId = 1;
+
+
+let segmentStartLatitude = null;
+
+let segmentStartLongitude = null;
+
+let segmentDistanceKm = 0;
+
+let segmentVehicleIds = new Set();
+
+let nextVehicleSegmentId = 1;
+
+
+async function loadModel() {
+
+    try {
+
+        statusText.innerText =
+            "Loading ONNX models...";
+
+
+        session =
+            await ort.InferenceSession.create(
+                MODEL_PATH
+            );
+
+
+        console.log(
+            "Pothole ONNX model loaded successfully"
+        );
+
+
+        console.log(
+            "Pothole inputs:",
+            session.inputNames
+        );
+
+
+        console.log(
+            "Pothole outputs:",
+            session.outputNames
+        );
+
+
+        vehicleSession =
+            await ort.InferenceSession.create(
+                VEHICLE_MODEL_PATH
+            );
+
+
+        console.log(
+            "Vehicle ONNX model loaded successfully"
+        );
+
+
+        console.log(
+            "Vehicle inputs:",
+            vehicleSession.inputNames
+        );
+
+
+        console.log(
+            "Vehicle outputs:",
+            vehicleSession.outputNames
+        );
+
+
+        statusText.innerText =
+            "🟢 AI models loaded - ready";
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "Model loading error:",
+            error
+        );
+
+
+        statusText.innerText =
+            "❌ AI model failed to load";
+
+    }
+
+}
+
+
+async function startDetection() {
+
+    if (
+        !session ||
+        !vehicleSession
+    ) {
+
+        alert(
+            "AI models are still loading."
+        );
+
+        return;
+
+    }
+
+
+    if (detectionRunning) {
+
+        return;
+
+    }
+
+
+    try {
+
+        const stream =
+            await navigator.mediaDevices
+                .getUserMedia({
+
+                    video: {
+
+                        facingMode: {
+                            ideal: "environment"
+                        }
+
+                    },
+
+                    audio: false
+
+                });
+
+
+        video.srcObject =
+            stream;
+
+
+        await video.play();
+
+
+        if (
+            video.videoWidth === 0
+        ) {
+
+            await new Promise(
+                resolve => {
+
+                    video.onloadedmetadata =
+                        resolve;
+
+                }
+            );
+
+        }
+
+
+        canvas.width =
+            video.videoWidth;
+
+        canvas.height =
+            video.videoHeight;
+
+
+        if (
+            "geolocation" in navigator
+        ) {
+
+            gpsWatcher =
+                navigator.geolocation.watchPosition(
+
+                    function(position) {
+
+                        const newLatitude =
+                            position.coords.latitude;
+
+                        const newLongitude =
+                            position.coords.longitude;
+
+
+                        if (
+                            latitude === null ||
+                            longitude === null
+                        ) {
+
+                            latitude =
+                                newLatitude;
+
+                            longitude =
+                                newLongitude;
+
+
+                            startNewVehicleSegment();
+
+                        }
+
+                        else {
+
+                            const movementKm =
+                                calculateDistanceKm(
+
+                                    latitude,
+
+                                    longitude,
+
+                                    newLatitude,
+
+                                    newLongitude
+
+                                );
+
+
+                            latitude =
+                                newLatitude;
+
+                            longitude =
+                                newLongitude;
+
+
+                            if (
+                                movementKm > 0
+                            ) {
+
+                                segmentDistanceKm +=
+                                    movementKm;
+
+
+                                updateSegmentDistance();
+
+
+                                if (
+                                    segmentDistanceKm >=
+                                    VEHICLE_DISTANCE_TARGET_KM
+                                ) {
+
+                                    completeVehicleSegment();
+
+                                }
+
+                            }
+
+                        }
+
+
+                        locationText.innerHTML =
+
+                            "Latitude: " +
+
+                            latitude.toFixed(6) +
+
+                            "<br>" +
+
+                            "Longitude: " +
+
+                            longitude.toFixed(6);
+
+
+                        console.log(
+                            "GPS:",
+                            latitude,
+                            longitude
+                        );
+
+                    },
+
+                    function(error) {
+
+                        console.error(
+                            "GPS error:",
+                            error
+                        );
+
+
+                        locationText.innerText =
+                            "❌ GPS unavailable";
+
+                    },
+
+                    {
+
+                        enableHighAccuracy:
+                            true,
+
+                        maximumAge:
+                            0,
+
+                        timeout:
+                            10000
+
+                    }
+
+                );
+
+        }
+
+        else {
+
+            locationText.innerText =
+                "❌ GPS not supported";
+
+        }
+
+
+        locationTimer =
+            setInterval(
+
+                sendLocationUpdate,
+
+                LOCATION_INTERVAL
+
+            );
+
+
+        detectionRunning =
+            true;
+
+
+        statusText.innerText =
+            "🟢 Live AI detection running";
+
+
+        startButton.innerText =
+            "🟢 Detection Running";
+
+
+        detectFrame();
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "Camera error:",
+            error
+        );
+
+
+        alert(
+            "Could not start camera."
+        );
+
+    }
+
+}
+
+
+async function detectFrame() {
+
+    if (
+        !detectionRunning
+    ) {
+
+        return;
+
+    }
+
+
+    try {
+
+        if (
+
+            video.readyState >= 2 &&
+
+            video.videoWidth > 0
+
+        ) {
+
+            const results =
+                await runInference();
+
+
+            drawDetections(
+                results
+            );
+
+
+            updatePotholeTracks(
+                results.potholes
+            );
+
+
+            updateVehicleTracks(
+                results.vehicles
+            );
+
+        }
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "Detection error:",
+            error
+        );
+
+    }
+
+
+    requestAnimationFrame(
+        detectFrame
+    );
+
+}
+
+
+async function runInference() {
+
+    const size =
+        INPUT_SIZE;
+
+
+    const inputCanvas =
+        document.createElement("canvas");
+
+
+    inputCanvas.width =
+        size;
+
+    inputCanvas.height =
+        size;
+
+
+    const inputCtx =
+        inputCanvas.getContext("2d");
+
+
+    const videoWidth =
+        video.videoWidth;
+
+    const videoHeight =
+        video.videoHeight;
+
+
+    const scale =
+        Math.min(
+
+            size / videoWidth,
+
+            size / videoHeight
+
+        );
+
+
+    const resizedWidth =
+        videoWidth * scale;
+
+    const resizedHeight =
+        videoHeight * scale;
+
+
+    const padX =
+        (size - resizedWidth) / 2;
+
+    const padY =
+        (size - resizedHeight) / 2;
+
+
+    inputCtx.fillStyle =
+        "rgb(114, 114, 114)";
+
+
+    inputCtx.fillRect(
+        0,
+        0,
+        size,
+        size
+    );
+
+
+    inputCtx.drawImage(
+
+        video,
+
+        0,
+        0,
+        videoWidth,
+        videoHeight,
+
+        padX,
+        padY,
+        resizedWidth,
+        resizedHeight
+
+    );
+
+
+    const imageData =
+        inputCtx.getImageData(
+
+            0,
+            0,
+            size,
+            size
+
+        );
+
+
+    const imageSize =
+        size * size;
+
+
+    const inputData =
+        new Float32Array(
+            3 * imageSize
+        );
+
+
+    for (
+        let i = 0;
+        i < imageSize;
+        i++
+    ) {
+
+        const pixel =
+            i * 4;
+
+
+        inputData[i] =
+            imageData.data[pixel] /
+            255.0;
+
+
+        inputData[
+            imageSize + i
+        ] =
+            imageData.data[pixel + 1] /
+            255.0;
+
+
+        inputData[
+            2 * imageSize + i
+        ] =
+            imageData.data[pixel + 2] /
+            255.0;
+
+    }
+
+
+    const inputTensor =
+        new ort.Tensor(
+
+            "float32",
+
+            inputData,
+
+            [1, 3, size, size]
+
+        );
+
+
+    const potholeOutputs =
+        await session.run({
+
+            images:
+                inputTensor
+
+        });
+
+
+    const potholeOutput =
+        potholeOutputs.output0;
+
+
+    const potholes =
+        parsePotholeDetections(
+            potholeOutput
+        );
+
+
+    const vehicleOutputs =
+        await vehicleSession.run({
+
+            images:
+                inputTensor
+
+        });
+
+
+    const vehicleOutput =
+        vehicleOutputs.output0;
+
+
+    const vehicles =
+        parseVehicleDetections(
+            vehicleOutput
+        );
+
+
+    const fixCoordinates =
+        (detections) => {
+
+            return detections
+                .map(
+                    detection => {
+
+                        const originalX =
+                            (detection.x - padX) /
+                            scale;
+
+                        const originalY =
+                            (detection.y - padY) /
+                            scale;
+
+                        const originalWidth =
+                            detection.width /
+                            scale;
+
+                        const originalHeight =
+                            detection.height /
+                            scale;
+
+
+                        return {
+
+                            ...detection,
+
+                            x:
+                                originalX *
+                                size /
+                                videoWidth,
+
+                            y:
+                                originalY *
+                                size /
+                                videoHeight,
+
+                            width:
+                                originalWidth *
+                                size /
+                                videoWidth,
+
+                            height:
+                                originalHeight *
+                                size /
+                                videoHeight
+
+                        };
+
+                    }
+                )
+                .filter(
+                    detection => {
+
+                        return (
+
+                            detection.x +
+                            detection.width >
+                            0 &&
+
+                            detection.y +
+                            detection.height >
+                            0 &&
+
+                            detection.x <
+                            size &&
+
+                            detection.y <
+                            size
+
+                        );
+
+                    }
+                );
+
+        };
+
+
+    return {
+
+        potholes:
+            nonMaximumSuppression(
+                fixCoordinates(
+                    potholes
+                )
+            ),
+
+        vehicles:
+            vehicleNonMaximumSuppression(
+                fixCoordinates(
+                    vehicles
+                )
+            )
+
+    };
+
+}
+
+
+function parsePotholeDetections(
+    output
+) {
+
+    const values =
+        output.data;
+
+
+    const numDetections =
+        8400;
+
+
+    const detections =
+        [];
+
+
+    for (
+        let i = 0;
+        i < numDetections;
+        i++
+    ) {
+
+        const confidence =
+            values[
+                4 *
+                numDetections +
+                i
+            ];
+
+
+        if (
+            confidence <
+            CONFIDENCE_THRESHOLD
+        ) {
+
+            continue;
+
+        }
+
+
+        const cx =
+            values[i];
+
+
+        const cy =
+            values[
+                numDetections +
+                i
+            ];
+
+
+        const width =
+            values[
+                2 *
+                numDetections +
+                i
+            ];
+
+
+        const height =
+            values[
+                3 *
+                numDetections +
+                i
+            ];
+
+
+        detections.push({
+
+            x:
+                cx -
+                width / 2,
+
+            y:
+                cy -
+                height / 2,
+
+            width:
+                width,
+
+            height:
+                height,
+
+            confidence:
+                confidence
+
+        });
+
+    }
+
+
+    return detections;
+
+}
+
+
+function parseVehicleDetections(
+    output
+) {
+
+    const data =
+        output.data;
+
+
+    const numDetections =
+        8400;
+
+
+    const numClasses =
+        80;
+
+
+    const VEHICLE_CLASSES = {
+
+        2:
+            "Car",
+
+        3:
+            "Motorcycle",
+
+        5:
+            "Bus",
+
+        7:
+            "Truck"
+
+    };
+
+
+    const detections =
+        [];
+
+
+    for (
+        let i = 0;
+        i < numDetections;
+        i++
+    ) {
+
+        const cx =
+            data[i];
+
+
+        const cy =
+            data[
+                numDetections +
+                i
+            ];
+
+
+        const width =
+            data[
+                2 *
+                numDetections +
+                i
+            ];
+
+
+        const height =
+            data[
+                3 *
+                numDetections +
+                i
+            ];
+
+
+        let bestClass =
+            -1;
+
+
+        let bestConfidence =
+            0;
+
+
+        for (
+            let c = 0;
+            c < numClasses;
+            c++
+        ) {
+
+            const confidence =
+                data[
+                    (4 + c) *
+                    numDetections +
+                    i
+                ];
+
+
+            if (
+                confidence >
+                bestConfidence
+            ) {
+
+                bestConfidence =
+                    confidence;
+
+                bestClass =
+                    c;
+
+            }
+
+        }
+
+
+        if (
+
+            VEHICLE_CLASSES[
+                bestClass
+            ] &&
+
+            bestConfidence >=
+            VEHICLE_CONFIDENCE_THRESHOLD
+
+        ) {
+
+            detections.push({
+
+                x:
+                    cx -
+                    width / 2,
+
+                y:
+                    cy -
+                    height / 2,
+
+                width:
+                    width,
+
+                height:
+                    height,
+
+                confidence:
+                    bestConfidence,
+
+                classId:
+                    bestClass,
+
+                className:
+                    VEHICLE_CLASSES[
+                        bestClass
+                    ]
+
+            });
+
+        }
+
+    }
+
+
+    return detections;
+
+}
+
+
+function vehicleNonMaximumSuppression(
+    detections
+) {
+
+    detections.sort(
+
+        (a, b) =>
+            b.confidence -
+            a.confidence
+
+    );
+
+
+    const selected =
+        [];
+
+
+    while (
+        detections.length > 0
+    ) {
+
+        const current =
+            detections.shift();
+
+
+        selected.push(
+            current
+        );
+
+
+        detections =
+            detections.filter(
+
+                candidate =>
+
+                    calculateIoU(
+                        current,
+                        candidate
+                    ) <
+                    NMS_IOU_THRESHOLD
+
+            );
+
+    }
+
+
+    return selected;
+
+}
+
+
+function nonMaximumSuppression(
+    detections
+) {
+
+    detections.sort(
+
+        (a, b) =>
+            b.confidence -
+            a.confidence
+
+    );
+
+
+    const selected =
+        [];
+
+
+    while (
+        detections.length > 0
+    ) {
+
+        const current =
+            detections.shift();
+
+
+        selected.push(
+            current
+        );
+
+
+        detections =
+            detections.filter(
+
+                candidate =>
+
+                    calculateIoU(
+                        current,
+                        candidate
+                    ) <
+                    NMS_IOU_THRESHOLD
+
+            );
+
+    }
+
+
+    return selected;
+
+}
+
+
+function calculateIoU(
+    a,
+    b
+) {
+
+    const x1 =
+        Math.max(
+            a.x,
+            b.x
+        );
+
+
+    const y1 =
+        Math.max(
+            a.y,
+            b.y
+        );
+
+
+    const x2 =
+        Math.min(
+
+            a.x +
+            a.width,
+
+            b.x +
+            b.width
+
+        );
+
+
+    const y2 =
+        Math.min(
+
+            a.y +
+            a.height,
+
+            b.y +
+            b.height
+
+        );
+
+
+    const intersectionWidth =
+        Math.max(
+            0,
+            x2 - x1
+        );
+
+
+    const intersectionHeight =
+        Math.max(
+            0,
+            y2 - y1
+        );
+
+
+    const intersection =
+        intersectionWidth *
+        intersectionHeight;
+
+
+    const areaA =
+        a.width *
+        a.height;
+
+
+    const areaB =
+        b.width *
+        b.height;
+
+
+    const union =
+        areaA +
+        areaB -
+        intersection;
+
+
+    if (
+        union <= 0
+    ) {
+
+        return 0;
+
+    }
+
+
+    return (
+        intersection /
+        union
+    );
+
+}
+
+
+function drawDetections(
+    results
+) {
+
+    const potholes =
+        results.potholes;
+
+    const vehicles =
+        results.vehicles;
+
+
+    if (
+
+        canvas.width !==
+        video.videoWidth ||
+
+        canvas.height !==
+        video.videoHeight
+
+    ) {
+
+        canvas.width =
+            video.videoWidth;
+
+        canvas.height =
+            video.videoHeight;
+
+    }
+
+
+    ctx.clearRect(
+
+        0,
+        0,
+
+        canvas.width,
+        canvas.height
+
+    );
+
+
+    const scaleX =
+        canvas.width /
+        INPUT_SIZE;
+
+    const scaleY =
+        canvas.height /
+        INPUT_SIZE;
+
+
+    for (
+        const detection of
+        vehicles
+    ) {
+
+        const x =
+            detection.x *
+            scaleX;
+
+        const y =
+            detection.y *
+            scaleY;
+
+        const width =
+            detection.width *
+            scaleX;
+
+        const height =
+            detection.height *
+            scaleY;
+
+
+        ctx.strokeStyle =
+            "blue";
+
+        ctx.lineWidth =
+            4;
+
+
+        ctx.strokeRect(
+            x,
+            y,
+            width,
+            height
+        );
+
+
+        ctx.fillStyle =
+            "blue";
+
+        ctx.font =
+            "18px Arial";
+
+
+        const percentage =
+            (
+                detection.confidence *
+                100
+            ).toFixed(1);
+
+
+        ctx.fillText(
+
+            detection.className +
+            " " +
+            percentage +
+            "%",
+
+            x,
+
+            Math.max(
+                20,
+                y - 5
+            )
+
+        );
+
+    }
+
+
+    for (
+        const detection of
+        potholes
+    ) {
+
+        const x =
+            detection.x *
+            scaleX;
+
+        const y =
+            detection.y *
+            scaleY;
+
+        const width =
+            detection.width *
+            scaleX;
+
+        const height =
+            detection.height *
+            scaleY;
+
+
+        ctx.strokeStyle =
+            "red";
+
+        ctx.lineWidth =
+            4;
+
+
+        ctx.strokeRect(
+            x,
+            y,
+            width,
+            height
+        );
+
+
+        ctx.fillStyle =
+            "red";
+
+        ctx.font =
+            "18px Arial";
+
+
+        const percentage =
+            (
+                detection.confidence *
+                100
+            ).toFixed(1);
+
+
+        ctx.fillText(
+
+            "Pothole " +
+            percentage +
+            "%",
+
+            x,
+
+            Math.max(
+                20,
+                y - 5
+            )
+
+        );
+
+    }
+
+}
+
+
+function updateVehicleTracks(
+    detections
+) {
+
+    const now =
+        Date.now();
+
+
+    const matchedTracks =
+        new Set();
+
+
+    for (
+        const detection of
+        detections
+    ) {
+
+        let closestTrack =
+            null;
+
+
+        let closestDistance =
+            VEHICLE_TRACK_DISTANCE_PIXELS +
+            1;
+
+
+        for (
+            const track of
+            vehicleTracks
+        ) {
+
+            if (
+                matchedTracks.has(
+                    track.id
+                )
+            ) {
+
+                continue;
+
+            }
+
+
+            const distance =
+                getDetectionDistance(
+
+                    detection,
+
+                    track.lastDetection
+
+                );
+
+
+            if (
+                distance <
+                closestDistance
+            ) {
+
+                closestDistance =
+                    distance;
+
+                closestTrack =
+                    track;
+
+            }
+
+        }
+
+
+        if (
+            closestTrack !== null
+        ) {
+
+            closestTrack.lastDetection =
+                detection;
+
+            closestTrack.lastSeen =
+                now;
+
+        }
+
+        else {
+
+            const newTrack = {
+
+                id:
+                    nextVehicleTrackId++,
+
+                segmentId:
+                    nextVehicleSegmentId++,
+
+                lastDetection:
+                    detection,
+
+                firstSeen:
+                    now,
+
+                lastSeen:
+                    now,
+
+                className:
+                    detection.className
+
+            };
+
+
+            vehicleTracks.push(
+                newTrack
+            );
+
+
+            segmentVehicleIds.add(
+                newTrack.segmentId
+            );
+
+
+            updateVehicleCount();
+
+        }
+
+    }
+
+
+    vehicleTracks =
+        vehicleTracks.filter(
+
+            track =>
+
+                now -
+                track.lastSeen
+                <
+                VEHICLE_TRACK_LOST_TIME
+
+        );
+
+}
+
+
+function updateVehicleCount() {
+
+    vehicleCountText.innerText =
+        segmentVehicleIds.size;
+
+}
+
+
+function startNewVehicleSegment() {
+
+    segmentStartLatitude =
+        latitude;
+
+    segmentStartLongitude =
+        longitude;
+
+    segmentDistanceKm =
+        0;
+
+    segmentVehicleIds =
+        new Set();
+
+    vehicleTracks =
+        [];
+
+    updateVehicleCount();
+
+    updateSegmentDistance();
+
+}
+
+
+function completeVehicleSegment() {
+
+    if (
+        latitude === null ||
+        longitude === null
+    ) {
+
+        return;
+
+    }
+
+
+    const vehicleCount =
+        segmentVehicleIds.size;
+
+
+    const report = {
+
+        bus_id:
+            BUS_ID,
+
+        distance_km:
+            Number(
+                segmentDistanceKm.toFixed(3)
+            ),
+
+        vehicle_count:
+            vehicleCount,
+
+        start_latitude:
+            Number(
+                segmentStartLatitude.toFixed(6)
+            ),
+
+        start_longitude:
+            Number(
+                segmentStartLongitude.toFixed(6)
+            ),
+
+        end_latitude:
+            Number(
+                latitude.toFixed(6)
+            ),
+
+        end_longitude:
+            Number(
+                longitude.toFixed(6)
+            ),
+
+        timestamp:
+            new Date().toISOString()
+
+    };
+
+
+    console.log(
+        "🚗 1 km vehicle report:",
+        report
+    );
+
+
+    sendVehicleReport(
+        report
+    );
+
+
+    segmentDistanceKm =
+        0;
+
+    segmentVehicleIds =
+        new Set();
+
+    vehicleTracks =
+        [];
+
+    updateVehicleCount();
+
+    updateSegmentDistance();
+
+
+    segmentStartLatitude =
+        latitude;
+
+    segmentStartLongitude =
+        longitude;
+
+}
+
+
+function calculateDistanceKm(
+    lat1,
+    lon1,
+    lat2,
+    lon2
+) {
+
+    const earthRadiusKm =
+        6371;
+
+
+    const dLat =
+        degreesToRadians(
+            lat2 - lat1
+        );
+
+
+    const dLon =
+        degreesToRadians(
+            lon2 - lon1
+        );
+
+
+    const a =
+
+        Math.sin(dLat / 2) *
+        Math.sin(dLat / 2)
+
+        +
+
+        Math.cos(
+            degreesToRadians(
+                lat1
+            )
+        )
+
+        *
+
+        Math.cos(
+            degreesToRadians(
+                lat2
+            )
+        )
+
+        *
+
+        Math.sin(dLon / 2) *
+        Math.sin(dLon / 2);
+
+
+    const c =
+        2 *
+        Math.atan2(
+
+            Math.sqrt(a),
+
+            Math.sqrt(1 - a)
+
+        );
+
+
+    return (
+        earthRadiusKm *
+        c
+    );
+
+}
+
+
+function degreesToRadians(
+    degrees
+) {
+
+    return (
+        degrees *
+        Math.PI /
+        180
+    );
+
+}
+
+
+function updateSegmentDistance() {
+
+    segmentDistanceText.innerText =
+
+        segmentDistanceKm.toFixed(2) +
+        " km";
+
+}
+
+
+async function sendLocationUpdate() {
+
+    if (
+        latitude === null ||
+        longitude === null
+    ) {
+
+        console.log(
+            "📍 Location not ready yet."
+        );
+
+        return;
+
+    }
+
+
+    const locationReport = {
+
+        bus_id:
+            BUS_ID,
+
+        latitude:
+            Number(
+                latitude.toFixed(6)
+            ),
+
+        longitude:
+            Number(
+                longitude.toFixed(6)
+            ),
+
+        timestamp:
+            new Date().toISOString()
+
+    };
+
+
+    console.log(
+        "📍 Sending location:",
+        locationReport
+    );
+
+
+    try {
+
+        const response =
+            await fetch(
+
+                LOCATION_API,
+
+                {
+
+                    method:
+                        "POST",
+
+                    headers: {
+
+                        "Content-Type":
+                            "application/json"
+
+                    },
+
+                    body:
+                        JSON.stringify(
+                            locationReport
+                        )
+
+                }
+
+            );
+
+
+        if (
+            !response.ok
+        ) {
+
+            throw new Error(
+                "HTTP " +
+                response.status
+            );
+
+        }
+
+
+        console.log(
+            "✅ Location sent"
+        );
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "❌ Location update failed:",
+            error
+        );
+
+    }
+
+}
+
+
+async function sendVehicleReport(
+    report
+) {
+
+    try {
+
+        const response =
+            await fetch(
+
+                TRAFFIC_API,
+
+                {
+
+                    method:
+                        "POST",
+
+                    headers: {
+
+                        "Content-Type":
+                            "application/json"
+
+                    },
+
+                    body:
+                        JSON.stringify(
+                            report
+                        )
+
+                }
+
+            );
+
+
+        if (
+            !response.ok
+        ) {
+
+            throw new Error(
+                "HTTP " +
+                response.status
+            );
+
+        }
+
+
+        console.log(
+            "✅ 1 km vehicle report sent:",
+            report
+        );
+
+
+        lastSent.innerText =
+            new Date()
+                .toLocaleString();
+
+    }
+
+    catch (error) {
+
+        console.error(
+            "❌ Vehicle report failed:",
+            error
+        );
+
+    }
+
+}
+
+
+function getDetectionCenter(
+    detection
+) {
+
+    return {
+
+        x:
+            detection.x +
+            detection.width / 2,
+
+        y:
+            detection.y +
+            detection.height / 2
+
+    };
+
+}
+
+
+function getDetectionDistance(
+    detectionA,
+    detectionB
+) {
+
+    const centerA =
+        getDetectionCenter(
+            detectionA
+        );
+
+
+    const centerB =
+        getDetectionCenter(
+            detectionB
+        );
+
+
+    const dx =
+        centerA.x -
+        centerB.x;
+
+
+    const dy =
+        centerA.y -
+        centerB.y;
+
+
+    return Math.sqrt(
+
+        dx * dx +
+        dy * dy
+
+    );
+
+}
+
+
+function updatePotholeTracks(
+    detections
+) {
+
+    const now =
+        Date.now();
+
+
+    const matchedTracks =
+        new Set();
+
+
+    for (
+        const detection of
+        detections
+    ) {
+
+        let closestTrack =
+            null;
+
+
+        let closestDistance =
+            TRACK_DISTANCE_PIXELS +
+            1;
+
+
+        for (
+            const track of
+            potholeTracks
+        ) {
+
+            if (
+                matchedTracks.has(
+                    track.id
+                )
+            ) {
+
+                continue;
+
+            }
+
+
+            const distance =
+                getDetectionDistance(
+
+                    detection,
+
+                    track.lastDetection
+
+                );
+
+
+            if (
+                distance <
+                closestDistance
+            ) {
+
+                closestDistance =
+                    distance;
+
+                closestTrack =
+                    track;
+
+            }
+
+        }
+
+
+        if (
+            closestTrack !== null
+        ) {
+
+            closestTrack.lastDetection =
+                detection;
+
+            closestTrack.lastSeen =
+                now;
+
+
+            closestTrack.confidence =
+                Math.max(
+
+                    closestTrack.confidence,
+
+                    detection.confidence
+
+                );
+
+
+            matchedTracks.add(
+                closestTrack.id
+            );
+
+        }
+
+        else {
+
+            const newTrack = {
+
+                id:
+                    nextTrackId++,
+
+                lastDetection:
+                    detection,
+
+                firstSeen:
+                    now,
+
+                lastSeen:
+                    now,
+
+                reported:
+                    false,
+
+                confidence:
+                    detection.confidence
+
+            };
+
+
+            potholeTracks.push(
+                newTrack
+            );
+
+
+            matchedTracks.add(
+                newTrack.id
+            );
+
+
+            handleNewPothole(
+                newTrack
+            );
+
+        }
+
+    }
+
+
+    potholeTracks =
+        potholeTracks.filter(
+
+            track =>
+
+                now -
+                track.lastSeen
+                <
+                TRACK_LOST_TIME
+
+        );
+
+}
+
+
+function handleNewPothole(
+    track
+) {
+
+    if (
+        track.reported
+    ) {
+
+        return;
+
+    }
+
+
+    track.reported =
+        true;
+
+
+    createPotholeReport(
+        track.confidence
+    );
+
+}
+
+
+function createPotholeReport(
+    confidence
+) {
+
+    if (
+        latitude === null ||
+        longitude === null
+    ) {
+
+        console.log(
+            "Pothole detected, but GPS is not ready."
+        );
+
+        return;
+
+    }
+
+
+    const now =
+        Date.now();
+
+
+    if (
+        now -
+        lastDetectionTime
+        <
+        DETECTION_COOLDOWN
+    ) {
+
+        return;
+
+    }
+
+
+    lastDetectionTime =
+        now;
+
+
+    const severity =
+
+        confidence >= 0.80
+            ? "high"
+
+            : confidence >= 0.60
+                ? "medium"
+
+                : "low";
+
+
+    const report = {
+
+        bus_id:
+            BUS_ID,
+
+        latitude:
+            Number(
+                latitude.toFixed(6)
+            ),
+
+        longitude:
+            Number(
+                longitude.toFixed(6)
+            ),
+
+        confidence:
+            Number(
+                confidence.toFixed(2)
+            ),
+
+        severity:
+            severity
+
+    };
+
+
+    pendingReports.push(
+        report
+    );
+
+
+    updateReportCount();
+
+
+    addDetectionToLog(
+        report
+    );
+
+
+    console.log(
+        "📦 New pothole report:",
+        report
+    );
+
+}
+
+
+function updateReportCount() {
+
+    reportCount.innerText =
+        pendingReports.length;
+
+}
+
+
+function addDetectionToLog(
+    report
+) {
+
+    const div =
+        document.createElement(
+            "div"
+        );
+
+
+    div.style.padding =
+        "8px 0";
+
+
+    div.style.borderBottom =
+        "1px solid #444";
+
+
+    div.innerHTML =
+
+        "🕳️ Pothole detected" +
+
+        "<br>📍 " +
+
+        report.latitude +
+
+        ", " +
+
+        report.longitude +
+
+        "<br>🎯 Confidence: " +
+
+        (
+
+            report.confidence *
+            100
+
+        ).toFixed(0) +
+
+        "%" +
+
+        "<br>⚠️ Severity: " +
+
+        report.severity;
+
+
+    reportLog.prepend(
+        div
+    );
+
+}
+
+
+setInterval(
+
+    sendReports,
+
+    REPORT_INTERVAL
+
+);
+
+
+async function sendReports() {
+
+    if (
+        pendingReports.length === 0
+    ) {
+
+        console.log(
+            "No pothole reports to send."
+        );
+
+        return;
+
+    }
+
+
+    const reportsToSend =
+        [
+            ...pendingReports
+        ];
+
+
+    console.log(
+        "🚀 Sending pothole reports:",
+        reportsToSend
+    );
+
+
+    for (
+        const report of
+        reportsToSend
+    ) {
+
+        try {
+
+            const response =
+                await fetch(
+
+                    POTHOLE_API,
+
+                    {
+
+                        method:
+                            "POST",
+
+                        headers: {
+
+                            "Content-Type":
+                                "application/json"
+
+                        },
+
+                        body:
+                            JSON.stringify(
+                                report
+                            )
+
+                    }
+
+                );
+
+
+            if (
+                !response.ok
+            ) {
+
+                throw new Error(
+                    "HTTP " +
+                    response.status
+                );
+
+            }
+
+
+            console.log(
+                "✅ Pothole report sent:",
+                report
+            );
+
+
+            const index =
+                pendingReports.indexOf(
+                    report
+                );
+
+
+            if (
+                index !== -1
+            ) {
+
+                pendingReports.splice(
+                    index,
+                    1
+                );
+
+            }
+
+
+            lastSent.innerText =
+                new Date()
+                    .toLocaleString();
+
+
+            updateReportCount();
+
+        }
+
+        catch (error) {
+
+            console.error(
+                "❌ Failed to send pothole report:",
+                error
+            );
+
+
+            console.log(
+                "Report kept for retry:",
+                report
+            );
+
+        }
+
+    }
+
+}
+
+
+loadModel();
+
+</script>
+
+</body>
+</html>
